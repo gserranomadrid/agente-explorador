@@ -1,12 +1,14 @@
+# app/services/cognition.py
 from __future__ import annotations
 
 import json
+import re
 from enum import Enum
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -64,6 +66,13 @@ FEW_SHOT_THRESHOLD = 0.65
 MAX_FEW_SHOT_EXAMPLES = 3
 MAX_EMAIL_CHARS = 12000
 
+_STOPWORDS = {
+    "correo", "correos", "sobre", "para", "como", "esta", "este", "estos",
+    "estas", "unas", "unos", "desde", "hasta", "entre", "cual", "cuales",
+    "quien", "donde", "tiene", "tienen", "tema", "temas", "relacionado",
+    "relacionados", "acerca", "busco", "buscar", "dime", "mostrar", "ver",
+}
+
 
 class CognitionService:
     def __init__(
@@ -80,6 +89,11 @@ class CognitionService:
             f"REMITENTE: {sender}\n\n"
             f"CUERPO:\n{(body or '')[:MAX_EMAIL_CHARS]}"
         )
+
+    @staticmethod
+    def _extract_keywords(text: str) -> list[str]:
+        tokens = re.findall(r"[a-zA-ZáéíóúÁÉÍÓÚñÑ0-9]+", text.lower())
+        return [t for t in tokens if len(t) >= 4 and t not in _STOPWORDS]
 
     async def _post(self, path: str, payload: dict) -> dict:
         base_url = settings.OLLAMA_BASE_URL.rstrip("/")
@@ -168,8 +182,8 @@ class CognitionService:
     ) -> ClasificacionCorreo:
         system_prompt = SYSTEM_PROMPT
         if rule_instructions:
-            system_prompt += "\nReglas institucionales aplicables:\n- "
-            system_prompt += "\n- ".join(rule_instructions)
+            system_prompt += "\nReglas institucionales aplicables:\n"
+            system_prompt += "\n".join(rule_instructions)
 
         messages = [{"role": "system", "content": system_prompt}]
         for example in examples or []:
@@ -211,33 +225,20 @@ class CognitionService:
                 "Ollama no devolvió una clasificación que cumpla el esquema."
             ) from exc
 
-    async def find_similar_feedback(
+    def _format_memory_match(
         self,
-        db: AsyncSession,
-        embedding: list[float],
-    ) -> list[dict[str, Any]]:
-        distance = MemoriaEpisodica.embedding.cosine_distance(embedding)
-        result = await db.execute(
-            select(MemoriaEpisodica, distance.label("distance"))
-            .where(
-                MemoriaEpisodica.embedding.is_not(None),
-                func.vector_dims(MemoriaEpisodica.embedding) == len(embedding),
-                MemoriaEpisodica.correccion_usuario.is_not(None),
-            )
-            .order_by(distance)
-            .limit(MAX_FEW_SHOT_EXAMPLES)
-        )
+        memory: MemoriaEpisodica,
+        similarity: float,
+        strict_few_shot: bool,
+    ) -> dict[str, Any] | None:
+        decision = memory.decision_agente or {}
+        label = memory.correccion_usuario or decision
 
-        matches = []
-        for memory, cosine_distance in result.all():
-            if cosine_distance is None:
-                continue
-            similarity = 1 - float(cosine_distance)
-            if similarity < FEW_SHOT_THRESHOLD:
-                continue
+        if not isinstance(label, dict):
+            label = {"datos_crudos": str(label)}
 
-            label = memory.correccion_usuario or memory.decision_agente
-            example_input = memory.decision_agente.get("entrada")
+        if strict_few_shot:
+            example_input = decision.get("entrada")
             required_fields = {
                 "razonamiento",
                 "categoria",
@@ -246,22 +247,91 @@ class CognitionService:
                 "periodo",
                 "nivel_confianza",
             }
-            if (
-                not example_input
-                or not isinstance(label, dict)
-                or not required_fields.issubset(label)
-            ):
-                continue
-            matches.append(
-                {
-                    "input": example_input,
-                    "label": label,
-                    "similarity": similarity,
-                    "memory_id": str(memory.id),
-                    "created_at": memory.created_at,
-                    "was_correct": memory.fue_correcto,
-                }
+            if not example_input or not required_fields.issubset(label):
+                return None
+        else:
+            example_input = (
+                decision.get("entrada")
+                or f"Metadatos: {json.dumps(decision, ensure_ascii=False)}"
             )
+
+        return {
+            "input": example_input,
+            "label": label,
+            "similarity": similarity,
+            "memory_id": str(memory.id),
+            "created_at": memory.created_at,
+            "was_correct": memory.fue_correcto,
+        }
+
+    async def find_similar_feedback(
+        self,
+        db: AsyncSession,
+        embedding: list[float],
+        solo_corregidos: bool = True,
+        umbral: float = FEW_SHOT_THRESHOLD,
+        limite: int = MAX_FEW_SHOT_EXAMPLES,
+        query_text: str | None = None,
+    ) -> list[dict[str, Any]]:
+        distance = MemoriaEpisodica.embedding.cosine_distance(embedding)
+        matches: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        # 1. BÚSQUEDA LÉXICA DIRECTA (Para búsqueda híbrida en RAG)
+        if not solo_corregidos and query_text:
+            keywords = self._extract_keywords(query_text)
+            if keywords:
+                text_col = cast(MemoriaEpisodica.decision_agente, String)
+                corr_col = cast(MemoriaEpisodica.correccion_usuario, String)
+                conditions = []
+                for kw in keywords:
+                    # Quitamos últimos caracteres para tolerar acentos (ej. programacion / programación)
+                    stem = kw[:-1] if len(kw) > 5 else kw
+                    conditions.append(text_col.ilike(f"%{stem}%"))
+                    conditions.append(corr_col.ilike(f"%{stem}%"))
+
+                lex_query = (
+                    select(MemoriaEpisodica, distance.label("distance"))
+                    .where(or_(*conditions))
+                    .order_by(distance)
+                    .limit(limite)
+                )
+                lex_result = await db.execute(lex_query)
+                for memory, cosine_distance in lex_result.all():
+                    sim = (1 - float(cosine_distance)) if cosine_distance is not None else 0.75
+                    formatted = self._format_memory_match(memory, max(sim, 0.75), False)
+                    if formatted and formatted["memory_id"] not in seen_ids:
+                        seen_ids.add(formatted["memory_id"])
+                        matches.append(formatted)
+
+        if len(matches) >= limite:
+            return matches[:limite]
+
+        # 2. BÚSQUEDA VECTORIAL SEMÁNTICA
+        vec_query = select(MemoriaEpisodica, distance.label("distance")).where(
+            MemoriaEpisodica.embedding.is_not(None),
+            func.vector_dims(MemoriaEpisodica.embedding) == len(embedding),
+        )
+        if solo_corregidos:
+            vec_query = vec_query.where(MemoriaEpisodica.correccion_usuario.is_not(None))
+
+        vec_query = vec_query.order_by(distance).limit(limite)
+        vec_result = await db.execute(vec_query)
+
+        for memory, cosine_distance in vec_result.all():
+            if len(matches) >= limite:
+                break
+            if cosine_distance is None:
+                continue
+            similarity = 1 - float(cosine_distance)
+            if similarity < umbral:
+                continue
+
+            formatted = self._format_memory_match(memory, similarity, solo_corregidos)
+            if formatted and formatted["memory_id"] not in seen_ids:
+                seen_ids.add(formatted["memory_id"])
+                matches.append(formatted)
+
         return matches
 
     async def _find_similar_feedback(
@@ -269,7 +339,9 @@ class CognitionService:
         db: AsyncSession,
         embedding: list[float],
     ) -> list[dict[str, str]]:
-        matches = await self.find_similar_feedback(db, embedding)
+        matches = await self.find_similar_feedback(
+            db, embedding, solo_corregidos=True
+        )
         return [
             {
                 "input": match["input"],
@@ -277,3 +349,75 @@ class CognitionService:
             }
             for match in matches
         ]
+
+    # --- ANÁLISIS CON CONTEXTO (RAG HÍBRIDO) ---
+    async def analizar_con_contexto(
+        self,
+        pregunta: str,
+        db: AsyncSession,
+    ) -> str:
+        embedding_pregunta = await self.embed_text(pregunta)
+
+        matches = await self.find_similar_feedback(
+            db,
+            embedding_pregunta,
+            solo_corregidos=False,
+            umbral=0.10,
+            limite=5,
+            query_text=pregunta,
+        )
+
+        if not matches:
+            return "No se encontraron registros relacionados en la memoria episódica."
+
+        textos_contexto = []
+        for i, match in enumerate(matches):
+            label = match["label"]
+            entrada_corta = str(match["input"])[:600]
+            categoria = label.get("categoria", "Sin categoría")
+            dependencia = label.get("dependencia_emisora", "Desconocida")
+            tipo_doc = label.get("tipo_documento", "No identificado")
+            resumen_ia = label.get("razonamiento", "")
+
+            textos_contexto.append(
+                f"Registro {i+1} (Relevancia: {match['similarity']:.2f}):\n"
+                f"- Categoría: {categoria} | Dependencia: {dependencia} | Tipo: {tipo_doc}\n"
+                f"- Análisis previo: {resumen_ia}\n"
+                f"- Contenido: {entrada_corta}\n"
+            )
+        contexto = "\n".join(textos_contexto)
+
+        prompt = (
+            "Eres el asistente de consulta del sistema institucional. Responde la pregunta del usuario "
+            "usando EXCLUSIVAMENTE los datos exactos de los registros recuperados.\n\n"
+            "REGLAS ESTRICTAS:\n"
+            "1. NO inventes ni sugieras categorías nuevas. Usa únicamente la 'Categoría' y 'Dependencia' registradas en los datos.\n"
+            "2. Indica claramente el Remitente, Asunto, Categoría asignada, Dependencia y el resumen del análisis.\n"
+            "3. Sé breve y directo.\n\n"
+            f"Registros recuperados:\n{contexto}\n\n"
+            f"Consulta del usuario: {pregunta}"
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "Reportas metadatos exactos de correos recuperados de la base de datos. Nunca inventes clasificaciones fuera de los registros.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        response = await self._post(
+            "/api/chat",
+            {
+                "model": settings.OLLAMA_CHAT_MODEL,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 350,
+                },
+            },
+        )
+
+        content = response.get("message", {}).get("content")
+        return content or "El modelo no logró generar una respuesta cognitiva."

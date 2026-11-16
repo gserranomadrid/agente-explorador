@@ -251,7 +251,7 @@ async def sync_emails(db: AsyncSession = Depends(get_db)):
 
 @router.post("/classify-pending")
 async def classify_pending_emails(
-    limit: int = Query(default=10, ge=1, le=50),
+    limit: int = Query(default=10, ge=1, le=100, description="Número máximo de correos pendientes a clasificar."),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(

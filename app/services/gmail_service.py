@@ -53,7 +53,7 @@ class GmailService:
     service = build("gmail", "v1", credentials=self.creds)
     return service.users().getProfile(userId="me").execute()
 
-  def fetch_inbox_emails(self, max_results=50):
+  def fetch_inbox_emails(self, max_results=70):
     creds = self.authenticate()
     service = build("gmail", "v1", credentials=creds)
 

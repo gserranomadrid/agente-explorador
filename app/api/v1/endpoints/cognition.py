@@ -1,3 +1,5 @@
+# app/api/v1/endpoints/cognition.py
+import json
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -16,6 +18,7 @@ from app.services.cognition import (
     CognitionService,
 )
 
+# ESTA ES LA LÍNEA QUE ARREGLA EL ERROR
 router = APIRouter()
 
 _CLASSIFICATION_FIELDS = (
@@ -26,10 +29,8 @@ _CLASSIFICATION_FIELDS = (
     "nivel_confianza",
 )
 
-
 class SemanticSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=MAX_EMAIL_CHARS)
-
 
 class ExtractionRuleCreate(BaseModel):
     category: CategoriaCorreo
@@ -52,12 +53,10 @@ class ExtractionRuleCreate(BaseModel):
             raise ValueError("La instrucción no puede estar vacía.")
         return value
 
-
 def _classification_summary(value):
     if not isinstance(value, dict):
         return None
     return {field: value.get(field) for field in _CLASSIFICATION_FIELDS}
-
 
 async def _ollama_status():
     try:
@@ -94,7 +93,6 @@ async def _ollama_status():
         "chat_model_available": is_available(settings.OLLAMA_CHAT_MODEL),
         "embedding_model_available": is_available(settings.OLLAMA_EMBEDDING_MODEL),
     }
-
 
 @router.get("/diagnostics")
 async def get_cognition_diagnostics(db: AsyncSession = Depends(get_db)):
@@ -167,7 +165,6 @@ async def get_cognition_diagnostics(db: AsyncSession = Depends(get_db)):
         ],
     }
 
-
 @router.post("/rules", status_code=201)
 async def create_extraction_rule(
     request: ExtractionRuleCreate,
@@ -191,7 +188,6 @@ async def create_extraction_rule(
         "is_active": rule.is_active,
     }
 
-
 @router.post("/search")
 async def search_similar_memories(
     request: SemanticSearchRequest,
@@ -209,7 +205,7 @@ async def search_similar_memories(
             detail=f"No se pudo generar el embedding con Ollama: {exc}",
         ) from exc
 
-    matches = await cognition.find_similar_feedback(db, embedding)
+    matches = await cognition.find_similar_feedback(db, embedding, solo_corregidos=False, umbral=0.30)
     return {
         "query": request.query,
         "threshold": FEW_SHOT_THRESHOLD,
@@ -225,3 +221,30 @@ async def search_similar_memories(
             for match in matches
         ],
     }
+
+# ==========================================
+# RUTA PARA EL ANÁLISIS RAG (CEREBRO)
+# ==========================================
+class RagRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=1000)
+
+@router.post("/rag")
+async def analyze_with_context(
+    request: RagRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Recibe una pregunta, busca contexto en la BD (RAG) y devuelve la respuesta del LLM.
+    """
+    if not request.query.strip():
+        raise HTTPException(status_code=422, detail="La consulta no puede estar vacía.")
+
+    cognition = CognitionService()
+    try:
+        respuesta = await cognition.analizar_con_contexto(request.query, db)
+        return {"respuesta": respuesta}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error durante el análisis cognitivo: {str(exc)}",
+        )
