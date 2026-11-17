@@ -358,12 +358,13 @@ class CognitionService:
     ) -> str:
         embedding_pregunta = await self.embed_text(pregunta)
 
+        # 1. Subimos el límite de 5 a 10 para capturar múltiples correos coincidentes
         matches = await self.find_similar_feedback(
             db,
             embedding_pregunta,
             solo_corregidos=False,
             umbral=0.10,
-            limite=5,
+            limite=10,
             query_text=pregunta,
         )
 
@@ -373,7 +374,7 @@ class CognitionService:
         textos_contexto = []
         for i, match in enumerate(matches):
             label = match["label"]
-            entrada_corta = str(match["input"])[:600]
+            entrada_corta = str(match["input"])[:450]
             categoria = label.get("categoria", "Sin categoría")
             dependencia = label.get("dependencia_emisora", "Desconocida")
             tipo_doc = label.get("tipo_documento", "No identificado")
@@ -387,13 +388,14 @@ class CognitionService:
             )
         contexto = "\n".join(textos_contexto)
 
+        # 2. Prompt en PLURAL exigiendo listar todas las coincidencias encontradas
         prompt = (
-            "Eres el asistente de consulta del sistema institucional. Responde la pregunta del usuario "
-            "usando EXCLUSIVAMENTE los datos exactos de los registros recuperados.\n\n"
+            "Eres el asistente de consulta del sistema institucional. Revisa TODOS los registros recuperados "
+            "y responde la consulta del usuario.\n\n"
             "REGLAS ESTRICTAS:\n"
-            "1. NO inventes ni sugieras categorías nuevas. Usa únicamente la 'Categoría' y 'Dependencia' registradas en los datos.\n"
-            "2. Indica claramente el Remitente, Asunto, Categoría asignada, Dependencia y el resumen del análisis.\n"
-            "3. Sé breve y directo.\n\n"
+            "1. Si hay VARIOS correos que coinciden con la búsqueda, lístalos TODOS uno por uno (numerados). Nunca muestres solo el primero.\n"
+            "2. NO inventes categorías ni datos. Usa únicamente la 'Categoría', 'Dependencia', Remitente y Asunto de cada registro.\n"
+            "3. Ignora los registros de la lista que no tengan relación con lo que preguntó el usuario.\n\n"
             f"Registros recuperados:\n{contexto}\n\n"
             f"Consulta del usuario: {pregunta}"
         )
@@ -401,11 +403,12 @@ class CognitionService:
         messages = [
             {
                 "role": "system",
-                "content": "Reportas metadatos exactos de correos recuperados de la base de datos. Nunca inventes clasificaciones fuera de los registros.",
+                "content": "Reportas en una lista numerada TODOS los correos relevantes encontrados en los registros de la base de datos.",
             },
             {"role": "user", "content": prompt},
         ]
 
+        # 3. Subimos num_predict a 700 para que tenga espacio suficiente para listar varios correos
         response = await self._post(
             "/api/chat",
             {
@@ -414,7 +417,7 @@ class CognitionService:
                 "stream": False,
                 "options": {
                     "temperature": 0.1,
-                    "num_predict": 350,
+                    "num_predict": 700,
                 },
             },
         )
